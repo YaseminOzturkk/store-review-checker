@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import pandas as pd
 import requests
 import streamlit as st
+from bs4 import BeautifulSoup
 from google_play_scraper import app as google_play_app
 from openpyxl.styles import Alignment, Font, PatternFill
 
@@ -218,10 +219,17 @@ def _apple_request_with_retry(url: str) -> requests.Response:
 
 
 def _parse_apple_review_entries(xml_content: bytes) -> list[ET.Element]:
-    """Apple Atom XML akışındaki yazılı yorum kayıtlarını döndürür."""
+    """Apple Atom XML akışındaki yalnızca gerçek yazılı yorumları döndürür."""
     root = ET.fromstring(xml_content)
     atom_ns = "{http://www.w3.org/2005/Atom}"
-    return list(root.findall(f"{atom_ns}entry"))
+    im_ns = "{http://itunes.apple.com/rss}"
+
+    entries = list(root.findall(f"{atom_ns}entry"))
+    return [
+        entry
+        for entry in entries
+        if entry.find(f"{im_ns}rating") is not None
+    ]
 
 
 def _entry_text(entry: ET.Element, tag: str) -> str | None:
@@ -316,18 +324,199 @@ def count_apple_reviews_xml(
     return len(seen), False, last_date, None
 
 
+
+def _visible_review_key(card: Any) -> str | None:
+    """App Store sayfasındaki yorum kartını tekilleştiren anahtarı üretir."""
+    card_id = card.get("id") or card.get("aria-labelledby")
+    if card_id:
+        return str(card_id).strip()
+
+    title_node = card.select_one(
+        ".we-customer-review__title, "
+        "[data-test-customer-review-title], "
+        "h3"
+    )
+    body_node = card.select_one(
+        ".we-customer-review__body, "
+        "[data-test-customer-review-body], "
+        "blockquote"
+    )
+    date_node = card.select_one(
+        "[data-test-customer-review-date], "
+        "time.we-customer-review__date, "
+        "time"
+    )
+
+    title = title_node.get_text(" ", strip=True) if title_node else ""
+    body = body_node.get_text(" ", strip=True) if body_node else ""
+    date = ""
+    if date_node:
+        date = str(
+            date_node.get("datetime")
+            or date_node.get_text(" ", strip=True)
+            or ""
+        )
+
+    if not title and not body:
+        return None
+
+    return f"{title}|{date}|{body[:160]}"
+
+
+def parse_visible_apple_reviews(html_text: str) -> tuple[int, str | None]:
+    """
+    App Store web sayfasında görünür yazılı yorumları sayar.
+
+    Bu sayı toplam yorum sayısı değildir; Apple'ın herkese açık sayfada
+    gösterdiği yorumların alt sınırıdır.
+    """
+    soup = BeautifulSoup(html_text, "html.parser")
+    keys: set[str] = set()
+    dates: list[str] = []
+
+    selectors = [
+        ".we-customer-review",
+        "[data-test-customer-review]",
+        "article[class*='customer-review']",
+        "div[class*='customer-review']",
+    ]
+
+    cards: list[Any] = []
+    for selector in selectors:
+        cards.extend(soup.select(selector))
+
+    for card in cards:
+        key = _visible_review_key(card)
+        if not key:
+            continue
+
+        keys.add(key)
+
+        date_node = card.select_one(
+            "[data-test-customer-review-date], "
+            "time.we-customer-review__date, "
+            "time"
+        )
+        if date_node:
+            date_value = (
+                date_node.get("datetime")
+                or date_node.get_text(" ", strip=True)
+            )
+            if date_value:
+                dates.append(str(date_value))
+
+    # Apple sınıfları değiştirirse ham HTML'deki benzersiz review kimliklerini kullan.
+    if not keys:
+        keys.update(set(re.findall(r"we-customer-review-\d+", html_text)))
+
+    # Kart seçicileri değişmiş olsa da yorum tarihi işareti varsa en az bir yorum vardır.
+    if not keys and re.search(
+        r"data-test-customer-review-date", html_text, flags=re.I
+    ):
+        keys.add("visible-review-marker")
+
+    return len(keys), (dates[0] if dates else None)
+
+
+def count_visible_apple_reviews_page(
+    country: str,
+    app_id: str,
+    store_url: str | None,
+) -> tuple[int | None, str | None, str | None]:
+    """
+    Apple RSS boş döndüğünde App Store'un herkese açık yorum sayfasını kontrol eder.
+    """
+    candidate_urls: list[str] = []
+
+    if store_url:
+        separator = "&" if "?" in store_url else "?"
+        candidate_urls.append(
+            f"{store_url}{separator}platform=iphone&see-all=reviews"
+        )
+
+    candidate_urls.append(
+        f"https://apps.apple.com/{country}/app/id{app_id}"
+        "?platform=iphone&see-all=reviews"
+    )
+
+    errors: list[str] = []
+
+    for page_url in candidate_urls:
+        try:
+            response = requests.get(
+                page_url,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "text/html,application/xhtml+xml",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            errors.append(str(exc))
+            continue
+
+        visible_count, last_date = parse_visible_apple_reviews(response.text)
+
+        if visible_count > 0:
+            return (
+                visible_count,
+                last_date,
+                (
+                    "Apple RSS yorum döndürmedi. App Store web sayfasında "
+                    f"en az {visible_count} görünür yazılı yorum bulundu."
+                ),
+            )
+
+    error_text = "; ".join(errors[:2]) if errors else None
+    return None, None, error_text
+
 def check_app_store(url: str, parsed: dict[str, str | None]) -> dict[str, Any]:
     country = (parsed.get("country") or FALLBACK_COUNTRY).lower()
     app_id = str(parsed["identifier"])
     metadata = apple_lookup(app_id, country)
 
-    review_count, exact, last_date, review_warning = count_apple_reviews_xml(
+    rating_count_raw = metadata.get("userRatingCount")
+    rating_count = (
+        int(rating_count_raw) if rating_count_raw is not None else None
+    )
+    score = metadata.get("averageUserRating")
+
+    review_count, exact, last_date, rss_warning = count_apple_reviews_xml(
         country=country,
         app_id=app_id,
     )
 
-    rating_count = metadata.get("userRatingCount")
-    score = metadata.get("averageUserRating")
+    warning_parts: list[str] = []
+    if rss_warning:
+        warning_parts.append(rss_warning)
+
+    # Apple RSS bazı uygulamalarda 200 cevapla boş akış döndürebiliyor.
+    # Böyle bir durumda sonucu 0 kabul etmeden web yorum sayfasını kontrol et.
+    if review_count in {None, 0}:
+        page_count, page_last_date, page_warning = count_visible_apple_reviews_page(
+            country=country,
+            app_id=app_id,
+            store_url=metadata.get("trackViewUrl"),
+        )
+
+        if page_count is not None and page_count > 0:
+            review_count = page_count
+            exact = False
+            last_date = page_last_date or last_date
+            if page_warning:
+                warning_parts.append(page_warning)
+        elif review_count == 0 and rating_count == 0:
+            exact = True
+        else:
+            review_count = None
+            exact = None
+            warning_parts.append(
+                "Yazılı yorum sayısı doğrulanamadı; sonuç 0 olarak kabul edilmedi."
+            )
+            if page_warning:
+                warning_parts.append(page_warning)
 
     if review_count is None:
         has_written_reviews = "Bilinmiyor"
@@ -336,7 +525,7 @@ def check_app_store(url: str, parsed: dict[str, str | None]) -> dict[str, Any]:
         status = "Kısmi"
     elif review_count > 0:
         has_written_reviews = "Evet"
-        review_count_display = review_count if exact else f"{review_count}+"
+        review_count_display = review_count if exact else f"En az {review_count}"
         exact_display = "Evet" if exact else "Hayır"
         status = "Başarılı" if exact else "Kısmi"
     else:
@@ -344,6 +533,8 @@ def check_app_store(url: str, parsed: dict[str, str | None]) -> dict[str, Any]:
         review_count_display = 0 if exact else None
         exact_display = "Evet" if exact else "Bilinmiyor"
         status = "Başarılı" if exact else "Kısmi"
+
+    warning = " | ".join(dict.fromkeys(warning_parts)) or None
 
     return {
         "Uygulama": metadata.get("trackName"),
@@ -353,20 +544,19 @@ def check_app_store(url: str, parsed: dict[str, str | None]) -> dict[str, Any]:
         "Yazılı Yorum Var mı?": has_written_reviews,
         "Yazılı Yorum Sayısı": review_count_display,
         "Sayı Kesin mi?": exact_display,
-        "Puanlama Sayısı": int(rating_count) if rating_count is not None else None,
+        "Puanlama Sayısı": rating_count,
         "Ortalama Puan": round(float(score), 2) if score is not None else None,
         "Son Yorum Tarihi": last_date,
         "Uygulama Kimliği": app_id,
         "Durum": status,
-        "Hata": review_warning,
+        "Hata": warning,
         "Girilen Link": url,
         "Mağaza Linki": metadata.get("trackViewUrl") or url,
-        "Kaynak": "Apple Lookup + Apple Reviews XML",
+        "Kaynak": "Apple Lookup + RSS + App Store web sayfası",
         "Kontrol Zamanı (UTC)": datetime.now(timezone.utc).isoformat(
             timespec="seconds"
         ),
     }
-
 
 def error_result(url: str, error: Exception) -> dict[str, Any]:
     return {
